@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1073616743926",
+    "project_id": "nams-calling-system",
+    "storage_bucket": "nams-calling-system.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1073616743926:android:d651abcc61462458fb6bd7",
+        "android_client_info": {
+          "package_name": "com.example.nams_calling_system"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA8JQFHbvkax9c7ZMZHrKTajLmEF_KnZVE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
