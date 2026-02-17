@@ -56,6 +56,7 @@ class _HomePageState extends State<HomePage>
   bool isCalling = false;
   int currentCallIndex = 0;
   List<String> phoneNumbers = [];
+  List<bool> calledStatus = [];
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   // ===== Lifecycle =====
@@ -67,7 +68,21 @@ class _HomePageState extends State<HomePage>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (ModalRoute.of(context)?.isCurrent == true && !isListening && !_isSpeaking) {
+      if (currentUser != null) {
+        _loadUserPhoneNumbers(currentUser!);
+      }
+      requestPermissions();
+    }
+  }
+
+  @override
   void dispose() {
+    _isRestarting = false;
+    _speech.stop();
+    _speech.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -79,8 +94,7 @@ class _HomePageState extends State<HomePage>
       Permission.phone,
       Permission.storage,
     ].request();
-
-    await speak("Welcome! Say your name to begin.");
+    await speak("Say your name to begin.");
     await Future.delayed(const Duration(seconds: 1));
     startListening();
   }
@@ -110,24 +124,26 @@ class _HomePageState extends State<HomePage>
 
   // ===== Speech Listening =====
   Future<void> startListening() async {
-    if (_speech.isListening || _isRestarting) return;
+    if (_speech.isListening || _isRestarting || !mounted) return;
 
     _isRestarting = true;
 
     bool available = await _speech.initialize(
       onStatus: (status) {
+        if (!mounted) return;
         if (status == 'done' || status == 'notListening') {
           _restartListening();
         }
       },
       onError: (error) {
+        if (!mounted) return;
         if (error.errorMsg == 'error_speech_timeout') {
           _restartListening();
         }
       },
     );
 
-    if (available) {
+    if (available && mounted) {
       setState(() => isListening = true);
 
       await _speech.listen(
@@ -135,6 +151,7 @@ class _HomePageState extends State<HomePage>
         partialResults: false,
         pauseFor: const Duration(seconds: 5),
         onResult: (result) {
+          if (!mounted) return;
           if (!result.finalResult) return;
 
           final text = result.recognizedWords.trim().toLowerCase();
@@ -150,21 +167,22 @@ class _HomePageState extends State<HomePage>
   }
 
   void _restartListening() {
-    if (_isRestarting) return;
+    if (_isRestarting || !mounted) return;
 
     _isRestarting = true;
 
     Future.delayed(const Duration(seconds: 1), () async {
+      if (!mounted) return;
       if (_speech.isListening) {
         await _speech.stop();
       }
       _isRestarting = false;
-      startListening();
+      if (mounted) startListening();
     });
   }
 
   // ===== Voice Commands =====
-  void handleVoiceCommand(String command) {
+  Future<void> handleVoiceCommand(String command) async {
     if (_isSpeaking) return;
     
     // User identification
@@ -202,8 +220,13 @@ class _HomePageState extends State<HomePage>
         speak("No phone numbers found for $currentUser");
         return;
       }
+      int nextIndex = calledStatus.indexWhere((called) => !called);
+      if (nextIndex == -1) {
+        speak("All numbers have been called");
+        return;
+      }
       isCalling = true;
-      currentCallIndex = 0;
+      currentCallIndex = nextIndex;
       speak("Starting calling now", onComplete: () {
         startCallingFlow();
       });
@@ -214,6 +237,23 @@ class _HomePageState extends State<HomePage>
       speak("Calling stopped", onComplete: () {
         stopCallingFlow();
       });
+      return;
+    }
+
+    if (command.contains("next") && isCalling) {
+      await _markCurrentAsCalled();
+      await _loadUserPhoneNumbers(currentUser!);
+      int nextIndex = calledStatus.indexWhere((called) => !called);
+      if (nextIndex == -1) {
+        speak("All calls completed", onComplete: () {
+          stopCallingFlow();
+        });
+      } else {
+        currentCallIndex = nextIndex;
+        speak("Moving to next number", onComplete: () {
+          startCallingFlow();
+        });
+      }
       return;
     }
 
@@ -235,16 +275,27 @@ class _HomePageState extends State<HomePage>
     }
     
     try {
-      // Check if user exists
-      final userDoc = await _firestore.collection('users').doc(userName.toLowerCase()).get();
-      if (userDoc.exists) {
-        currentUser = userName;
-        await _loadUserPhoneNumbers(userName.toLowerCase());
-        speak("Hello $userName, you have ${phoneNumbers.length} numbers to call. Say start calling to begin.");
+      // Get all users and find a match
+      final usersSnapshot = await _firestore.collection('users').get();
+      String? matchedUser;
+      
+      for (var doc in usersSnapshot.docs) {
+        if (doc.id.toLowerCase() == userName.toLowerCase()) {
+          matchedUser = doc.id;
+          break;
+        }
+      }
+      
+      if (matchedUser != null) {
+        currentUser = matchedUser;
+        await _loadUserPhoneNumbers(matchedUser);
+        int remainingCalls = calledStatus.where((c) => !c).length;
+        speak("Hello $matchedUser, you have $remainingCalls numbers to call. Say start calling to begin.");
       } else {
         speak("User $userName not found. Please contact admin to add your numbers.");
       }
     } catch (e) {
+      print('Error finding user: $e');
       speak("Error finding user. Please try again.");
     }
   }
@@ -265,12 +316,20 @@ class _HomePageState extends State<HomePage>
         final data = doc.data() as Map<String, dynamic>;
         setState(() {
           phoneNumbers = List<String>.from(data['phone_numbers'] ?? []);
+          calledStatus = List<bool>.from(data['called_status'] ?? List.filled(phoneNumbers.length, false));
+          if (calledStatus.length != phoneNumbers.length) {
+            calledStatus = List.filled(phoneNumbers.length, false);
+          }
+          currentCallIndex = calledStatus.indexWhere((called) => !called);
+          if (currentCallIndex == -1) currentCallIndex = 0;
         });
+        print('📥 Loaded data: ${calledStatus.where((c) => c).length}/${phoneNumbers.length} called');
       }
     } catch (e) {
       print('Error loading user numbers: $e');
       setState(() {
         phoneNumbers = [];
+        calledStatus = [];
       });
     }
   }
@@ -289,7 +348,7 @@ class _HomePageState extends State<HomePage>
   void startCallingFlow() {
     if (!isCalling || _isSpeaking) return;
 
-    if (currentCallIndex >= phoneNumbers.length) {
+    if (currentCallIndex >= phoneNumbers.length || currentCallIndex < 0) {
       speak("All calls completed", onComplete: () {
         stopCallingFlow();
       });
@@ -304,19 +363,44 @@ class _HomePageState extends State<HomePage>
     });
   }
 
+  Future<void> _markCurrentAsCalled() async {
+    if (currentUser == null || currentCallIndex < 0 || currentCallIndex >= phoneNumbers.length) return;
+    
+    print('🔄 Attempting to mark index $currentCallIndex as called for user: $currentUser');
+    calledStatus[currentCallIndex] = true;
+    
+    try {
+      await _firestore.collection('users').doc(currentUser!).set({
+        'called_status': calledStatus,
+        'phone_numbers': phoneNumbers,
+      }, SetOptions(merge: true));
+      print('✅ Firebase updated: Number ${currentCallIndex + 1} marked as called');
+      print('📊 Current status: ${calledStatus.where((c) => c).length}/${phoneNumbers.length} called');
+      setState(() {});
+    } catch (e) {
+      print('❌ Error saving called status: $e');
+      print('❌ Error details: ${e.toString()}');
+      calledStatus[currentCallIndex] = false;
+      setState(() {});
+    }
+  }
+
   void stopCallingFlow() {
-    isCalling = false;
-    currentCallIndex = 0;
+    setState(() {
+      isCalling = false;
+    });
   }
 
   // ===== Detect Call End =====
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && isCalling && !_isSpeaking) {
-      currentCallIndex++;
-      Future.delayed(const Duration(seconds: 2), () {
-        startCallingFlow();
-      });
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
+    if (state == AppLifecycleState.resumed) {
+      if (currentUser != null) {
+        await _loadUserPhoneNumbers(currentUser!);
+      }
+      if (isCalling && !_isSpeaking) {
+        speak("Call ended. Say next to continue or stop calling to end.");
+      }
     }
   }
 
@@ -357,7 +441,7 @@ class _HomePageState extends State<HomePage>
                   if (currentUser != null) ...[
                     const SizedBox(height: 10),
                     Text(
-                      "${phoneNumbers.length} numbers ready",
+                      "${phoneNumbers.length} numbers (${calledStatus.where((c) => c).length} called)",
                       style: TextStyle(
                         color: Colors.white.withOpacity(0.7),
                         fontSize: 16,
@@ -371,7 +455,11 @@ class _HomePageState extends State<HomePage>
               bottom: 30,
               right: 30,
               child: FloatingActionButton.extended(
-                onPressed: () {
+                onPressed: () async {
+                  _isRestarting = false;
+                  await _speech.cancel();
+                  await _speech.stop();
+                  setState(() => isListening = false);
                   Navigator.push(
                     context,
                     MaterialPageRoute(builder: (context) => const LoginPage()),
@@ -445,6 +533,7 @@ class _AdminPanelState extends State<AdminPanel> {
     try {
       await _firestore.collection('users').doc(selectedUser!).set({
         'phone_numbers': phoneNumbers,
+        'called_status': List.filled(phoneNumbers.length, false),
         'updated_at': FieldValue.serverTimestamp(),
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -607,6 +696,46 @@ class _AdminPanelState extends State<AdminPanel> {
     );
   }
 
+  Future<void> _deleteUser(String userId) async {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1F2937),
+          title: const Text('Delete User', style: TextStyle(color: Colors.white)),
+          content: Text(
+            'Are you sure you want to delete $userId?',
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                await _firestore.collection('users').doc(userId).delete();
+                if (selectedUser == userId) {
+                  setState(() {
+                    selectedUser = null;
+                    phoneNumbers.clear();
+                  });
+                }
+                await _loadUsers();
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('User $userId deleted')),
+                );
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -660,34 +789,64 @@ class _AdminPanelState extends State<AdminPanel> {
                     ),
                     const SizedBox(height: 20),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: Colors.white.withOpacity(0.2)),
                       ),
-                      child: DropdownButton<String>(
-                        value: selectedUser,
-                        hint: const Text('Select User', style: TextStyle(color: Colors.white70)),
-                        dropdownColor: const Color(0xFF1F2937),
-                        style: const TextStyle(color: Colors.white),
-                        underline: Container(),
-                        isExpanded: true,
-                        items: users.map((user) {
-                          return DropdownMenuItem(
-                            value: user,
-                            child: Text(user.toUpperCase()),
-                          );
-                        }).toList(),
-                        onChanged: (value) {
-                          setState(() {
-                            selectedUser = value;
-                            phoneNumbers.clear();
-                          });
-                          if (value != null) {
-                            _loadUserPhoneNumbers(value);
-                          }
-                        },
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Select User:',
+                            style: TextStyle(color: Colors.white70, fontSize: 14),
+                          ),
+                          const SizedBox(height: 8),
+                          ...users.map((user) {
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 8),
+                              decoration: BoxDecoration(
+                                color: selectedUser == user
+                                    ? Colors.teal.withOpacity(0.3)
+                                    : Colors.white.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: selectedUser == user
+                                      ? Colors.teal
+                                      : Colors.white.withOpacity(0.1),
+                                ),
+                              ),
+                              child: ListTile(
+                                dense: true,
+                                title: Text(
+                                  user.toUpperCase(),
+                                  style: const TextStyle(color: Colors.white),
+                                ),
+                                trailing: IconButton(
+                                  onPressed: () => _deleteUser(user),
+                                  icon: const Icon(Icons.delete, color: Colors.red),
+                                  tooltip: 'Delete user',
+                                ),
+                                onTap: () {
+                                  setState(() {
+                                    selectedUser = user;
+                                    phoneNumbers.clear();
+                                  });
+                                  _loadUserPhoneNumbers(user);
+                                },
+                              ),
+                            );
+                          }).toList(),
+                          if (users.isEmpty)
+                            const Padding(
+                              padding: EdgeInsets.all(16.0),
+                              child: Text(
+                                'No users yet. Add a user to get started.',
+                                style: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                        ],
                       ),
                     ),
                     const SizedBox(height: 20),
