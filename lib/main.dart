@@ -58,6 +58,7 @@ class _HomePageState extends State<HomePage>
   List<String> phoneNumbers = [];
   List<bool> calledStatus = [];
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  bool _hasMarkedCalled = false;
 
   // ===== Lifecycle =====
   @override
@@ -241,7 +242,6 @@ class _HomePageState extends State<HomePage>
     }
 
     if (command.contains("next") && isCalling) {
-      await _markCurrentAsCalled();
       await _loadUserPhoneNumbers(currentUser!);
       int nextIndex = calledStatus.indexWhere((called) => !called);
       if (nextIndex == -1) {
@@ -355,6 +355,7 @@ class _HomePageState extends State<HomePage>
       return;
     }
 
+    _hasMarkedCalled = false;
     final number = phoneNumbers[currentCallIndex];
     speak("Calling number ${currentCallIndex + 1}", onComplete: () {
       Future.delayed(const Duration(seconds: 1), () {
@@ -395,11 +396,15 @@ class _HomePageState extends State<HomePage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
     if (state == AppLifecycleState.resumed) {
-      if (currentUser != null) {
+      if (isCalling && currentUser != null && !_hasMarkedCalled) {
+        _hasMarkedCalled = true;
+        await _markCurrentAsCalled();
         await _loadUserPhoneNumbers(currentUser!);
-      }
-      if (isCalling && !_isSpeaking) {
-        speak("Call ended. Say next to continue or stop calling to end.");
+        if (!_isSpeaking) {
+          speak("Call ended. Say next to continue or stop calling to end.");
+        }
+      } else if (currentUser != null) {
+        await _loadUserPhoneNumbers(currentUser!);
       }
     }
   }
